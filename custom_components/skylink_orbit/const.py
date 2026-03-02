@@ -3,7 +3,7 @@
 from datetime import timedelta
 
 DOMAIN = "skylink_orbit"
-PLATFORMS = ["cover"]
+PLATFORMS = ["cover", "binary_sensor"]
 
 # Config keys
 CONF_USERNAME = "username"

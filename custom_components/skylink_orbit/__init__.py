@@ -19,7 +19,7 @@ from .coordinator import SkyLinkOrbitCoordinator, SkyLinkOrbitData
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[Platform] = [Platform.COVER]
+PLATFORMS: list[Platform] = [Platform.COVER, Platform.BINARY_SENSOR]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
