@@ -1,0 +1,43 @@
+# Python virtual environment
+Lib/
+Include/
+Scripts/
+share/
+pyvenv.cfg
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# APK and reverse engineering files
+*.apk
+apk_extracted/
+*.jsp
+flows
+
+# Development/research scripts (not part of the integration)
+crack_*.py
+deep_*.py
+discover_*.py
+probe_*.py
+download_*.py
+extract_*.py
+focused_*.py
+decompile_*.py
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude session data
+.claude/
+
+# OS files
+Thumbs.db
+.DS_Store
+desktop.ini
