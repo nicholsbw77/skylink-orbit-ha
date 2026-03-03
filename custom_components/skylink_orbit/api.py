@@ -390,9 +390,10 @@ class OrbitHomeAPI:
     # ------------------------------------------------------------------
 
     # Door state mapping from numeric MQTT values to HA state strings
+    # Confirmed by user testing: 0=open, 1=closed, 4=moving
     _DOOR_STATE_MAP: dict[int, str] = {
-        0: "closed",
-        1: "open",
+        0: "open",
+        1: "closed",
         4: "opening",  # transitioning/moving
     }
 
