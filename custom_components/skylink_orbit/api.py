@@ -22,7 +22,7 @@ MQTT (door control and state):
       {"data":{"hub_id":"<id>","desired":{"mdev":{"ctrlgdo":{"cmd":0,"ts":"<ms>"}}}}}
   - State update payload (pushed by hub on door movement):
       {"data":{"hub_id":"<id>","reported":{"mdev":{"door":<int>,...}}}}
-      door values: 0=closed, 1=open, 4=moving/transitioning
+      door values: 0=open, 1=closed, other=moving
 """
 
 from __future__ import annotations
@@ -390,12 +390,13 @@ class OrbitHomeAPI:
     # ------------------------------------------------------------------
 
     # Door state mapping from numeric MQTT values to HA state strings
-    # Confirmed by user testing: 0=open, 1=closed, 4=moving
+    # Confirmed by user testing: 0=open, 1=closed
+    # Any other value (2, 3, 4, etc.) = door is in motion
     _DOOR_STATE_MAP: dict[int, str] = {
         0: "open",
         1: "closed",
-        4: "opening",  # transitioning/moving
     }
+    _DOOR_STATE_DEFAULT = "opening"  # any unmapped value = in motion
 
     def _get_mqtt_topics(self) -> dict[str, str]:
         acc = self._acc_no or ""
@@ -494,7 +495,14 @@ class OrbitHomeAPI:
 
             if hub_id and isinstance(mdev, dict) and "door" in mdev:
                 door_val = mdev["door"]
-                state = self._DOOR_STATE_MAP.get(door_val, "unknown")
+                state = self._DOOR_STATE_MAP.get(
+                    door_val, self._DOOR_STATE_DEFAULT
+                )
+                if door_val not in self._DOOR_STATE_MAP:
+                    _LOGGER.info(
+                        "MQTT unmapped door value: hub=%s door=%s -> treating as %s",
+                        hub_id, door_val, state,
+                    )
                 _LOGGER.info(
                     "MQTT state update: hub=%s door=%s -> %s",
                     hub_id, door_val, state,
