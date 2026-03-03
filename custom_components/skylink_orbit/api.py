@@ -16,12 +16,13 @@ MQTT (door control and state):
   - Broker: ssl://34.214.223.70:1899
   - Auth: username=acc_no, password=account_password
   - Topics:
-      Publish commands: skylink/things/client/{acc_no}/desire
-      Request state:    skylink/things/client/{acc_no}/get
-      State responses:  skylink/things/client/{acc_no}/get/result  (subscribe)
-      State updates:    skylink/things/client/{acc_no}/update/result (subscribe)
+      Publish commands:  skylink/things/client/{acc_no}/desire
+      State updates:     skylink/things/client/{acc_no}/update/result (subscribe)
   - GDO control payload:
       {"data":{"hub_id":"<id>","desired":{"mdev":{"ctrlgdo":{"cmd":0,"ts":"<ms>"}}}}}
+  - State update payload (pushed by hub on door movement):
+      {"data":{"hub_id":"<id>","reported":{"mdev":{"door":<int>,...}}}}
+      door values: 0=closed, 1=open, 4=moving/transitioning
 """
 
 from __future__ import annotations
@@ -123,7 +124,6 @@ class OrbitHomeAPI:
         self._mqtt_client: Any = None
         self._mqtt_connected = False
         self._state_callbacks: list[Callable] = []
-        self._pending_states: dict[str, asyncio.Future] = {}
 
     # ------------------------------------------------------------------
     # Session management
@@ -372,16 +372,35 @@ class OrbitHomeAPI:
         self._acc_no = acc_no
 
     # ------------------------------------------------------------------
-    # MQTT connection
+    # MQTT connection and state handling
+    #
+    # State updates arrive on: skylink/things/client/{acc_no}/update/result
+    # Payload format (confirmed via MQTT sniffer):
+    #   {"data":{"hub_id":"rA8qM4QS","reported":{"mdev":{
+    #       "door": 0,          <-- 0=closed, 1=open, 4=moving
+    #       "autoclose_en": 0,
+    #       "errno": 0,
+    #       "rssi": -53,
+    #       "ssid": "...",
+    #       "firstdoor": {"door": 0},
+    #       "fw": {"type":"1","ver":"...","ver_gdo":"..."}
+    #   }}}}
+    #
+    # The "get" topic does NOT return responses. State is push-only.
     # ------------------------------------------------------------------
+
+    # Door state mapping from numeric MQTT values to HA state strings
+    _DOOR_STATE_MAP: dict[int, str] = {
+        0: "closed",
+        1: "open",
+        4: "opening",  # transitioning/moving
+    }
 
     def _get_mqtt_topics(self) -> dict[str, str]:
         acc = self._acc_no or ""
         base = "skylink/things/client"
         return {
             "desire": f"{base}/{acc}/desire",
-            "get": f"{base}/{acc}/get",
-            "get_result": f"{base}/{acc}/get/result",
             "update_result": f"{base}/{acc}/update/result",
         }
 
@@ -391,19 +410,18 @@ class OrbitHomeAPI:
             return
 
         if not self._acc_no:
-            raise OrbitApiError("Cannot connect MQTT without acc_no -authenticate first")
+            raise OrbitApiError("Cannot connect MQTT without acc_no -- authenticate first")
 
         try:
             import paho.mqtt.client as mqtt
         except ImportError:
             raise OrbitApiError("paho-mqtt not installed")
 
-        client_id = f"{self._acc_no}{random.randint(0, 999)}"
+        client_id = f"{self._acc_no}_{random.randint(100, 999)}"
         _LOGGER.info("MQTT connecting: broker=34.214.223.70:1899 client_id=%s", client_id)
 
         # Handle paho-mqtt 1.x vs 2.x API change
         try:
-            # paho-mqtt 2.x
             from paho.mqtt.enums import CallbackAPIVersion
             self._mqtt_client = mqtt.Client(
                 CallbackAPIVersion.VERSION1,
@@ -411,7 +429,6 @@ class OrbitHomeAPI:
                 protocol=mqtt.MQTTv311,
             )
         except ImportError:
-            # paho-mqtt 1.x
             self._mqtt_client = mqtt.Client(
                 client_id=client_id,
                 protocol=mqtt.MQTTv311,
@@ -447,32 +464,50 @@ class OrbitHomeAPI:
 
     def _on_mqtt_connect(self, client: Any, userdata: Any, flags: Any, rc: int) -> None:
         if rc == 0:
-            _LOGGER.info("MQTT connected")
+            _LOGGER.info("MQTT connected successfully")
             self._mqtt_connected = True
             topics = self._get_mqtt_topics()
-            client.subscribe(topics["get_result"], qos=0)
+            # Only subscribe to update/result -- state is push-only
             client.subscribe(topics["update_result"], qos=0)
-            _LOGGER.debug("MQTT subscribed: %s, %s", topics["get_result"], topics["update_result"])
+            _LOGGER.info("MQTT subscribed: %s", topics["update_result"])
         else:
             rc_map = {1: "Bad protocol", 2: "Client ID rejected", 3: "Server unavailable",
                       4: "Bad credentials", 5: "Not authorised"}
             _LOGGER.error("MQTT connect failed: rc=%d (%s)", rc, rc_map.get(rc, "unknown"))
 
     def _on_mqtt_message(self, client: Any, userdata: Any, msg: Any) -> None:
+        """Handle incoming MQTT state update messages.
+
+        Expected payload:
+            {"data":{"hub_id":"...","reported":{"mdev":{"door":0,...}}}}
+        """
         try:
             payload = json.loads(msg.payload.decode("utf-8"))
             _LOGGER.debug("MQTT <<< %s: %s", msg.topic, payload)
 
-            for cb in self._state_callbacks:
-                try:
-                    cb(msg.topic, payload)
-                except Exception:
-                    _LOGGER.exception("MQTT state callback error")
+            # Parse hub_id and door state from the real payload format
+            data = payload.get("data", {})
+            hub_id = data.get("hub_id", "")
+            reported = data.get("reported", {})
+            mdev = reported.get("mdev", {}) if isinstance(reported, dict) else {}
 
-            for hub_id, future in list(self._pending_states.items()):
-                if not future.done():
-                    future.set_result(payload)
-                    del self._pending_states[hub_id]
+            if hub_id and isinstance(mdev, dict) and "door" in mdev:
+                door_val = mdev["door"]
+                state = self._DOOR_STATE_MAP.get(door_val, "unknown")
+                _LOGGER.info(
+                    "MQTT state update: hub=%s door=%s -> %s",
+                    hub_id, door_val, state,
+                )
+
+                # Notify all registered callbacks (coordinator listens here)
+                for cb in self._state_callbacks:
+                    try:
+                        cb(hub_id, state)
+                    except Exception:
+                        _LOGGER.exception("MQTT state callback error")
+            else:
+                _LOGGER.debug("MQTT message without door state: hub=%s data=%s", hub_id, data)
+
         except Exception:
             _LOGGER.exception("Error processing MQTT message on %s", msg.topic)
 
@@ -483,7 +518,12 @@ class OrbitHomeAPI:
         else:
             _LOGGER.debug("MQTT disconnected cleanly")
 
-    def register_state_callback(self, callback: Callable) -> None:
+    def register_state_callback(self, callback: Callable[[str, str], None]) -> None:
+        """Register a callback for door state updates.
+
+        Callback signature: callback(hub_id: str, state: str)
+        State values: "open", "closed", "opening", "unknown"
+        """
         self._state_callbacks.append(callback)
 
     # ------------------------------------------------------------------
@@ -519,54 +559,7 @@ class OrbitHomeAPI:
     async def stop_door(self, hub_id: str, position: str | None = None) -> None:
         await self.toggle_door(hub_id, position)
 
-    # ------------------------------------------------------------------
-    # State requests via MQTT
-    # ------------------------------------------------------------------
-
-    async def request_state(self, hub_id: str) -> dict[str, Any] | None:
-        if not self._mqtt_connected:
-            await self.connect_mqtt()
-
-        topic = self._get_mqtt_topics()["get"]
-        payload = json.dumps({"data": {"hub_id": hub_id}}, separators=(",", ":"))
-
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future = loop.create_future()
-        self._pending_states[hub_id] = future
-
-        if self._mqtt_client:
-            self._mqtt_client.publish(topic, payload, qos=0)
-
-        try:
-            return await asyncio.wait_for(future, timeout=10.0)
-        except asyncio.TimeoutError:
-            self._pending_states.pop(hub_id, None)
-            _LOGGER.debug("MQTT state request timed out for %s", hub_id)
-            return None
-
-    async def get_door_state(self, hub_id: str) -> str:
-        """Returns: open, closed, opening, closing, stopped, or unknown."""
-        state_data = await self.request_state(hub_id)
-        if state_data is None:
-            return "unknown"
-
-        # Try to extract state from various possible response shapes
-        data = state_data.get("data", state_data)
-        if isinstance(data, dict):
-            for key in ("state", "status", "door_state", "gdo_state"):
-                val = data.get(key)
-                if val is not None:
-                    return str(val).lower()
-
-            reported = data.get("reported", {})
-            if isinstance(reported, dict):
-                mdev = reported.get("mdev", {})
-                if isinstance(mdev, dict):
-                    gdo = mdev.get("gdo", mdev.get("ctrlgdo", {}))
-                    if isinstance(gdo, dict):
-                        state = gdo.get("state") or gdo.get("status")
-                        if state is not None:
-                            return str(state).lower()
-
-        _LOGGER.debug("Could not parse door state from MQTT response: %s", state_data)
-        return "unknown"
+    @property
+    def mqtt_connected(self) -> bool:
+        """Return True if MQTT is connected."""
+        return self._mqtt_connected
